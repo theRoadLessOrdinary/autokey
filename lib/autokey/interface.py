@@ -213,9 +213,6 @@ class XInterfaceBase(threading.Thread):
         self.listenerThread = threading.Thread(target=self.__flushEvents)
         self.clipboard = Clipboard()
 
-        # Displays replaced by __initMappings, waiting to be closed by the listener thread
-        self.__staleDisplays = []
-
         self.__initMappings()
 
         # Set initial lock state
@@ -270,15 +267,19 @@ class XInterfaceBase(threading.Thread):
         self.__ignoreRemap = False
 
     def __initMappings(self):
-        oldDisplay = getattr(self, "localDisplay", None)
-        self.localDisplay = display.Display()
-        if oldDisplay is not None:
-            # Every keymap change lands here. Without closing the previous connection, each one
-            # leaks an X client until the server refuses new clients ("Maximum number of clients
-            # reached"). The listener thread does the closing, see __closeStaleDisplays.
-            self.__staleDisplays.append(oldDisplay)
-        self.rootWindow = self.localDisplay.screen().root
-        self.rootWindow.change_attributes(event_mask=X.SubstructureNotifyMask|X.StructureNotifyMask)
+        # Every keymap change lands here. Open the X connection once and reuse it: a new
+        # display.Display() per call leaked an X client each time until the server refused new
+        # clients ("Maximum number of clients reached"), and closing the replaced one is not safe
+        # because window objects held by other threads stay bound to it. Same as upstream #1088.
+        if getattr(self, "localDisplay", None) is None:
+            self.localDisplay = display.Display()
+            self.rootWindow = self.localDisplay.screen().root
+            self.rootWindow.change_attributes(event_mask=X.SubstructureNotifyMask|X.StructureNotifyMask)
+        else:
+            # A new connection used to bring a fresh keymap cache with it. On the reused one,
+            # python-xlib keeps the cache from connect time, so re-read it the way Display() does.
+            info = self.localDisplay.display.info
+            self.localDisplay._update_keymap(info.min_keycode, info.max_keycode - info.min_keycode + 1)
         
         altList = self.localDisplay.keysym_to_keycodes(XK.XK_ISO_Level3_Shift)
         self.__usableOffsets = (0, 1)
@@ -986,21 +987,10 @@ class XInterfaceBase(threading.Thread):
     def __releaseKey(self, keyName):
         self.__sendKeyReleaseEvent(self.__lookupKeyCode(keyName), 0)
 
-    def __closeStaleDisplays(self):
-        # Only called by the listener thread, between two rounds of its loop. Closing a display
-        # while that thread is still reading from it raises ConnectionClosedError there, which
-        # makes __flushEvents exit AutoKey.
-        while self.__staleDisplays:
-            try:
-                self.__staleDisplays.pop().close()
-            except Exception:
-                logger.exception("Could not close a replaced X display connection")
-
     def __flushEvents(self):
         logger.debug("__flushEvents: Entering event loop.")
         while True:
             try:
-                self.__closeStaleDisplays()
                 readable, w, e = select.select([self.localDisplay], [], [], 1)
                 time.sleep(1)
                 if self.localDisplay in readable:
